@@ -97,7 +97,9 @@ def build_training_frame(matches: pd.DataFrame, min_played: int = 3) -> tuple[pd
             f = fb.features(m.home, m.away, m.date, bool(m.neutral))
             f.update(league=league, date=m.date, home=m.home, away=m.away,
                      y_outcome=0 if m.hg > m.ag else 1 if m.hg == m.ag else 2,
-                     y_corners=(m.hc + m.ac) if not (np.isnan(m.hc) or np.isnan(m.ac)) else np.nan)
+                     y_corners=m.hc + m.ac, y_hc=m.hc, y_ac=m.ac,          # NaN propagates when a stat is missing
+                     y_goals=m.hg + m.ag, y_hg=m.hg, y_ag=m.ag,
+                     y_sot=m.hst + m.ast, y_hst=m.hst, y_ast=m.ast)
             rows.append(f)
             fb.update(m)
         builders[league] = fb
@@ -108,7 +110,7 @@ def build_training_frame(matches: pd.DataFrame, min_played: int = 3) -> tuple[pd
 
 def feature_matrix(frame: pd.DataFrame, leagues: list[str]) -> pd.DataFrame:
     """Numeric design matrix (+ league one-hot when several leagues are pooled)."""
-    X = frame.drop(columns=[c for c in META_COLS if c in frame.columns]).astype(float)
+    X = frame.drop(columns=[c for c in frame.columns if c in META_COLS or c.startswith("y_")]).astype(float)
     if len(X) > 1:  # training matrix: drop variables the data source does not provide (e.g. possession)
         X = X.loc[:, X.notna().any()]
     if len(leagues) > 1:

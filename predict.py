@@ -18,6 +18,7 @@ import pandas as pd
 
 from fmp.data import LEAGUES, current_teams, load_league, upcoming_fixtures
 from fmp.features import build_training_frame, feature_matrix
+from fmp.pipeline import TARGETS, count_predict, fit_count_target
 from fmp.models import (CORNER_LINES, OUTCOME_LABELS, corner_ensemble_backtest, evaluate_corner_models,
                         evaluate_outcome_models, fit_corner_ensemble, fit_outcome_ensemble, outcome_metrics_table,
                         predict_corners, predict_outcome, prob_over, time_split)
@@ -270,6 +271,28 @@ def main() -> None:
             L, pu, row = best_under
             print(f">>> RECOMENDACIÓN UNDER (línea más baja con P ≥ {args.conf:.0%}): MENOS DE {L} córners "
                   f"— prob. {pu:.0%} | precisión histórica under {pct(row['precision_under']).strip()}, recall under {pct(row['recall_under']).strip()}")
+    # ---- goals and shots on target (same method as corners) --------------- #
+    for key in ("goals", "sot"):
+        t = TARGETS[key]
+        ct = fit_count_target(frame, leagues_to_load, key, seed=args.seed)
+        if ct is None:
+            print(f"\n({t['label']}: la fuente actual no trae este dato para esta liga)")
+            continue
+        r = count_predict(ct, x, league, args.conf)
+        top = ct["table"].head(2)
+        print(f"\n{t['label'].upper()} - total esperado: {r['mu']:.2f}  ({home} {r['mu_home']:.2f} | {away} {r['mu_away']:.2f})")
+        print("    TOP 2 modelos: " + "  y  ".join(
+            f"{m.modelo} (acc {pct(m.accuracy).strip()}, prec {pct(m.precision).strip()}, rec {pct(m.recall).strip()})" for m in top.itertuples()))
+        print(f"{'Línea':>6}{'P(Over)':>10}{'P(Under)':>10}{'Veredicto':>12}{'Acc. hist.':>12}{'Prec. hist.':>13}{'Rec. hist.':>12}")
+        for row in r["lines"].itertuples(index=False):
+            print(f"{row[0]:>6}{pct(row[1]):>10}{pct(row[2]):>10}{row[3]:>12}{pct(row[4]):>12}{pct(row[5]):>13}{pct(row[6]):>12}")
+        bo, bu = r["best_over"], r["best_under"]
+        if bo:
+            print(f">>> OVER recomendado: MÁS DE {bo['linea']} {t['unit']} — prob. {bo['prob']:.0%} | "
+                  f"precisión histórica de la señal {pct(bo['precision']).strip()} (n={bo['n']})")
+        if bu:
+            print(f">>> UNDER recomendado: MENOS DE {bu['linea']} {t['unit']} — prob. {bu['prob']:.0%} | "
+                  f"precisión histórica under {pct(bu['precision']).strip()}")
     print()
 
 

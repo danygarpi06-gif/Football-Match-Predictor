@@ -48,9 +48,9 @@ def corner_models(seed: int = 42) -> dict:
     return {
         "Ridge (lineal)": make_pipeline(clone(imp), StandardScaler(), Ridge(alpha=5.0)),
         "Random Forest": make_pipeline(clone(imp), RandomForestRegressor(
-            n_estimators=500, min_samples_leaf=8, max_features=0.5, n_jobs=-1, random_state=seed)),
+            n_estimators=200, min_samples_leaf=10, max_features=0.33, max_samples=0.5, n_jobs=-1, random_state=seed)),
         "Extra Trees": make_pipeline(clone(imp), ExtraTreesRegressor(
-            n_estimators=500, min_samples_leaf=8, max_features=0.5, n_jobs=-1, random_state=seed)),
+            n_estimators=200, min_samples_leaf=10, max_features=0.33, n_jobs=-1, random_state=seed)),
         "Gradient Boosting (Poisson)": make_pipeline(HistGradientBoostingRegressor(
             loss="poisson", learning_rate=0.03, max_iter=500, max_leaf_nodes=12, min_samples_leaf=30,
             l2_regularization=2.0, early_stopping=True, validation_fraction=0.15, n_iter_no_change=30, random_state=seed)),
@@ -145,7 +145,9 @@ def line_metrics(y: np.ndarray, mu: np.ndarray, alpha: float, lines=CORNER_LINES
     return pd.DataFrame(rows)
 
 
-def evaluate_corner_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int = 42) -> tuple[pd.DataFrame, dict]:
+def evaluate_corner_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int = 42,
+                           lines=CORNER_LINES, rank_lines=RANK_LINES) -> tuple[pd.DataFrame, dict]:
+    """Works for any count target (corners, goals, shots on target)."""
     Xtr, Xte, ytr, yte = X.iloc[:split], X.iloc[split:], y.iloc[:split].to_numpy(), y.iloc[split:].to_numpy()
     rows, info = [], {}
     kf = KFold(n_splits=3, shuffle=False)
@@ -154,8 +156,8 @@ def evaluate_corner_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int 
         alpha = _dispersion(ytr, oof)
         model.fit(Xtr, ytr)
         mu = model.predict(Xte)
-        lm = line_metrics(yte, mu, alpha)
-        central = lm[lm["linea"].isin(RANK_LINES)]
+        lm = line_metrics(yte, mu, alpha, lines=lines)
+        central = lm[lm["linea"].isin(rank_lines)]
         score = float(((central["accuracy"] + central["precision_over"] + central["recall_over"]) / 3).mean())
         rows.append({"modelo": name, "MAE": mean_absolute_error(yte, mu), "accuracy": central["accuracy"].mean(),
                      "precision": central["precision_over"].mean(), "recall": central["recall_over"].mean(),
@@ -166,13 +168,13 @@ def evaluate_corner_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int 
 
 
 def corner_ensemble_backtest(names: list[str], info: dict, ytr: np.ndarray, yte: np.ndarray, conf: float,
-                             mask: np.ndarray | None = None) -> tuple[pd.DataFrame, float]:
+                             mask: np.ndarray | None = None, lines=CORNER_LINES) -> tuple[pd.DataFrame, float]:
     mu = np.mean([info[n]["mu_test"] for n in names], axis=0)
     oof = np.mean([info[n]["oof"] for n in names], axis=0)
     alpha = _dispersion(ytr, oof)
     if mask is not None:
         mu, yte = mu[mask], yte[mask]
-    return line_metrics(yte, mu, alpha, conf=conf), alpha
+    return line_metrics(yte, mu, alpha, lines=lines, conf=conf), alpha
 
 
 def fit_corner_ensemble(names: list[str], X: pd.DataFrame, y: pd.Series, seed: int = 42) -> list:

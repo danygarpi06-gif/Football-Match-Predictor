@@ -73,6 +73,21 @@ Los nombres de equipo aceptan coincidencias parciales (`--home "Man City"`, `--a
    línea más alta** cuya probabilidad supera la confianza (`--conf`), mostrando la precisión que esa
    señal tuvo en el backtest (para no "ganar" córners a costa de precisión).
 
+## Goles y tiros al arco
+
+Además de los córners, el programa predice el **total de goles** y el **total de tiros al arco** del
+partido, con el reparto esperado por equipo. Usa el mismo método: 5 modelos de regresión, se eligen
+los 2 mejores y se calcula el over/under por línea (goles 0.5 a 4.5, tiros al arco 5.5 a 11.5) con su
+accuracy, precisión y recall históricos.
+
+## Interfaz web
+
+```bash
+./.venv/bin/streamlit run app.py
+```
+
+Para publicarla: subir el repositorio a GitHub y desplegar `app.py` en Streamlit Community Cloud.
+
 ## Notas
 
 * Los nombres de equipos son los de ESPN (p. ej. "Club León", "Atlético Madrid").
