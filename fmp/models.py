@@ -1,4 +1,11 @@
-"""Model zoo, evaluation and selection (top-2 by accuracy / precision / recall)."""
+"""Model zoo, evaluation and selection.
+
+Chronological 3-way split, so that reported numbers are honest:
+  * train (oldest 70%)      -> models are fitted here
+  * validation (next 15%)   -> used to pick the top-2 models and calibrate over/under probabilities
+  * test (most recent 15%)  -> never used for any decision; only for the final report
+The models that predict future matches are then refitted on all the data.
+"""
 from __future__ import annotations
 
 import warnings
@@ -13,7 +20,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (accuracy_score, f1_score, log_loss, mean_absolute_error, precision_score,
                              recall_score)
-from sklearn.model_selection import KFold, cross_val_predict
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -59,40 +65,58 @@ def corner_models(seed: int = 42) -> dict:
     }
 
 
-def time_split(n: int, test_frac: float = 0.2, min_test: int = 150) -> int:
-    """Index where the chronological hold-out starts."""
-    return max(int(n * (1 - test_frac)), 0) if n - int(n * (1 - test_frac)) >= min_test else max(n - min_test, n // 2)
+SPLITS = {"train": "Entrenamiento", "val": "Validación", "test": "Prueba"}
+ENSEMBLE = "Combinación top 2"
+
+
+def three_way_split(n: int, frac: float = 0.15, min_part: int = 120) -> tuple[int, int]:
+    """Indices where validation and test start (rows must be sorted by date)."""
+    part = max(int(n * frac), min(min_part, n // 5))
+    return n - 2 * part, n - part
+
+
+def split_masks(n: int, i_val: int, i_test: int) -> dict[str, np.ndarray]:
+    idx = np.arange(n)
+    return {"train": idx < i_val, "val": (idx >= i_val) & (idx < i_test), "test": idx >= i_test}
 
 
 # --------------------------------------------------------------------------- #
 # 1X2 outcome
 # --------------------------------------------------------------------------- #
-def outcome_metrics_table(preds: dict[str, np.ndarray], yte: np.ndarray, mask: np.ndarray | None = None) -> pd.DataFrame:
-    """Accuracy / macro precision / macro recall per model on the hold-out (optionally a subset)."""
-    rows = []
-    for name, proba in preds.items():
-        if mask is not None:
-            proba, y = proba[mask], yte[mask]
-        else:
-            y = yte
-        pred = proba.argmax(axis=1)
-        acc = accuracy_score(y, pred)
-        prec = precision_score(y, pred, average="macro", zero_division=0)
-        rec = recall_score(y, pred, average="macro", zero_division=0)
-        rows.append({"modelo": name, "accuracy": acc, "precision": prec, "recall": rec,
-                     "f1": f1_score(y, pred, average="macro", zero_division=0),
-                     "log_loss": log_loss(y, proba, labels=[0, 1, 2]), "score": (acc + prec + rec) / 3})
+def class_metrics(y: np.ndarray, proba: np.ndarray) -> dict:
+    pred = proba.argmax(axis=1)
+    acc = accuracy_score(y, pred)
+    prec = precision_score(y, pred, average="macro", zero_division=0)
+    rec = recall_score(y, pred, average="macro", zero_division=0)
+    return {"accuracy": acc, "precision": prec, "recall": rec,
+            "f1": f1_score(y, pred, average="macro", zero_division=0),
+            "log_loss": log_loss(y, proba, labels=[0, 1, 2]), "score": (acc + prec + rec) / 3}
+
+
+def outcome_table(preds: dict[str, np.ndarray], y: np.ndarray, mask: np.ndarray) -> pd.DataFrame:
+    """One row per model with the metrics on the rows selected by `mask`."""
+    rows = [{"modelo": name, **class_metrics(y[mask], proba[mask])} for name, proba in preds.items()]
     return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
 
 
-def evaluate_outcome_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int = 42) -> tuple[pd.DataFrame, dict]:
-    """Train the 5 classifiers on the oldest `split` rows, evaluate on the most recent ones."""
-    Xtr, Xte, ytr, yte = X.iloc[:split], X.iloc[split:], y.iloc[:split], y.iloc[split:].to_numpy()
-    preds = {}
+def _long_table(per_model: dict[str, dict[str, dict]], ranking: list[str]) -> pd.DataFrame:
+    rows = [{"modelo": name, "conjunto": SPLITS[sp], **per_model[name][sp]} for name in ranking for sp in SPLITS]
+    return pd.DataFrame(rows)
+
+
+def evaluate_outcome_models(X: pd.DataFrame, y: pd.Series, i_val: int, i_test: int, seed: int = 42) -> dict:
+    """Fit the 5 classifiers on train, rank them on validation, report train / validation / test."""
+    yv, masks = y.to_numpy(), split_masks(len(y), i_val, i_test)
+    preds, per_model = {}, {}
     for name, model in outcome_models(seed).items():
-        model.fit(Xtr, ytr)
-        preds[name] = model.predict_proba(Xte)
-    return outcome_metrics_table(preds, yte), preds
+        model.fit(X.iloc[:i_val], y.iloc[:i_val])
+        preds[name] = model.predict_proba(X)
+        per_model[name] = {sp: class_metrics(yv[m], preds[name][m]) for sp, m in masks.items()}
+    ranking = sorted(per_model, key=lambda n: per_model[n]["val"]["score"], reverse=True)
+    top2 = ranking[:2]
+    preds[ENSEMBLE] = np.mean([preds[n] for n in top2], axis=0)
+    per_model[ENSEMBLE] = {sp: class_metrics(yv[m], preds[ENSEMBLE][m]) for sp, m in masks.items()}
+    return {"metrics": _long_table(per_model, ranking + [ENSEMBLE]), "preds": preds, "top2": top2}
 
 
 def fit_outcome_ensemble(names: list[str], X: pd.DataFrame, y: pd.Series, seed: int = 42) -> list:
@@ -108,7 +132,7 @@ def predict_outcome(models: list, x: pd.DataFrame) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# corners
+# count targets: corners, goals, shots on target
 # --------------------------------------------------------------------------- #
 def _dispersion(y: np.ndarray, mu: np.ndarray) -> float:
     """Negative-binomial dispersion alpha (var = mu + alpha*mu^2) by method of moments."""
@@ -118,7 +142,7 @@ def _dispersion(y: np.ndarray, mu: np.ndarray) -> float:
 
 
 def prob_over(mu: np.ndarray, alpha: float, line: float) -> np.ndarray:
-    """P(total corners > line) under NegBin(mu, alpha) (Poisson when alpha == 0)."""
+    """P(total > line) under NegBin(mu, alpha) (Poisson when alpha == 0)."""
     mu = np.clip(np.asarray(mu, dtype=float), 0.5, 30.0)
     k = int(np.floor(line))
     if alpha <= 1e-6:
@@ -129,6 +153,7 @@ def prob_over(mu: np.ndarray, alpha: float, line: float) -> np.ndarray:
 
 
 def line_metrics(y: np.ndarray, mu: np.ndarray, alpha: float, lines=CORNER_LINES, conf: float = 0.5) -> pd.DataFrame:
+    """Over/under classification metrics for every line."""
     rows = []
     for L in lines:
         p = prob_over(mu, alpha, L)
@@ -138,43 +163,44 @@ def line_metrics(y: np.ndarray, mu: np.ndarray, alpha: float, lines=CORNER_LINES
         rows.append({"linea": L, "pct_over_real": actual.mean(), "accuracy": accuracy_score(actual, pred),
                      "precision_over": precision_score(actual, pred, zero_division=0),
                      "recall_over": recall_score(actual, pred, zero_division=0),
+                     "f1_over": f1_score(actual, pred, zero_division=0),
                      "precision_under": precision_score(~actual, ~pred, zero_division=0),
                      "recall_under": recall_score(~actual, ~pred, zero_division=0),
+                     "f1_under": f1_score(~actual, ~pred, zero_division=0),
                      "senal_n": int(sig.sum()),
                      "senal_precision": float(actual[sig].mean()) if sig.any() else np.nan})
     return pd.DataFrame(rows)
 
 
-def evaluate_corner_models(X: pd.DataFrame, y: pd.Series, split: int, seed: int = 42,
-                           lines=CORNER_LINES, rank_lines=RANK_LINES) -> tuple[pd.DataFrame, dict]:
-    """Works for any count target (corners, goals, shots on target)."""
-    Xtr, Xte, ytr, yte = X.iloc[:split], X.iloc[split:], y.iloc[:split].to_numpy(), y.iloc[split:].to_numpy()
-    rows, info = [], {}
-    kf = KFold(n_splits=3, shuffle=False)
+def count_metrics(y: np.ndarray, mu: np.ndarray, alpha: float, lines, rank_lines) -> dict:
+    """Regression error (MAE, RMSE) + over/under metrics averaged over the central lines."""
+    lm = line_metrics(y, mu, alpha, lines=lines)
+    c = lm[lm["linea"].isin(rank_lines)]
+    acc, prec, rec = c["accuracy"].mean(), c["precision_over"].mean(), c["recall_over"].mean()
+    return {"MAE": mean_absolute_error(y, mu), "RMSE": float(np.sqrt(np.mean((y - mu) ** 2))),
+            "accuracy": acc, "precision": prec, "recall": rec, "f1": c["f1_over"].mean(),
+            "score": (acc + prec + rec) / 3}
+
+
+def evaluate_count_models(X: pd.DataFrame, y: pd.Series, i_val: int, i_test: int, seed: int = 42,
+                          lines=CORNER_LINES, rank_lines=RANK_LINES) -> dict:
+    """Fit the 5 regressors on train, calibrate + rank on validation, report train / validation / test."""
+    yv, masks = y.to_numpy(), split_masks(len(y), i_val, i_test)
+    mus, alphas, per_model = {}, {}, {}
+
+    def add(name: str, mu: np.ndarray) -> None:
+        mus[name] = mu
+        alphas[name] = _dispersion(yv[masks["val"]], mu[masks["val"]])   # out-of-sample calibration
+        per_model[name] = {sp: count_metrics(yv[m], mu[m], alphas[name], lines, rank_lines) for sp, m in masks.items()}
+
     for name, model in corner_models(seed).items():
-        oof = cross_val_predict(clone(model), Xtr, ytr, cv=kf)          # out-of-fold -> honest dispersion
-        alpha = _dispersion(ytr, oof)
-        model.fit(Xtr, ytr)
-        mu = model.predict(Xte)
-        lm = line_metrics(yte, mu, alpha, lines=lines)
-        central = lm[lm["linea"].isin(rank_lines)]
-        score = float(((central["accuracy"] + central["precision_over"] + central["recall_over"]) / 3).mean())
-        rows.append({"modelo": name, "MAE": mean_absolute_error(yte, mu), "accuracy": central["accuracy"].mean(),
-                     "precision": central["precision_over"].mean(), "recall": central["recall_over"].mean(),
-                     "score": score})
-        info[name] = {"model": model, "alpha": alpha, "mu_test": mu, "oof": oof}
-    table = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
-    return table, info
-
-
-def corner_ensemble_backtest(names: list[str], info: dict, ytr: np.ndarray, yte: np.ndarray, conf: float,
-                             mask: np.ndarray | None = None, lines=CORNER_LINES) -> tuple[pd.DataFrame, float]:
-    mu = np.mean([info[n]["mu_test"] for n in names], axis=0)
-    oof = np.mean([info[n]["oof"] for n in names], axis=0)
-    alpha = _dispersion(ytr, oof)
-    if mask is not None:
-        mu, yte = mu[mask], yte[mask]
-    return line_metrics(yte, mu, alpha, lines=lines, conf=conf), alpha
+        model.fit(X.iloc[:i_val], yv[:i_val])
+        add(name, model.predict(X))
+    ranking = sorted(per_model, key=lambda n: per_model[n]["val"]["score"], reverse=True)
+    top2 = ranking[:2]
+    add(ENSEMBLE, np.mean([mus[n] for n in top2], axis=0))
+    return {"metrics": _long_table(per_model, ranking + [ENSEMBLE]), "top2": top2,
+            "mu": mus[ENSEMBLE], "alpha": alphas[ENSEMBLE]}
 
 
 def fit_corner_ensemble(names: list[str], X: pd.DataFrame, y: pd.Series, seed: int = 42) -> list:

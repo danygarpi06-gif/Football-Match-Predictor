@@ -60,18 +60,29 @@ Los nombres de equipo aceptan coincidencias parciales (`--home "Man City"`, `--a
    partidos (puntos, goles, tiros, tiros a puerta, córners a favor/en contra, posesión), forma como
    local/visitante, descanso, momentum, head-to-head y córners esperados por el cruce
    ataque-defensa.
-3. **Resultado 1X2 – 5 modelos**: Regresión Logística, Random Forest, Extra Trees, Gradient
-   Boosting y Red Neuronal (MLP). Se entrenan con el 80 % más antiguo y se evalúan en el 20 % más
-   reciente (accuracy, precision macro, recall macro, F1, log-loss). Se eligen los **2 mejores** por
-   el promedio de accuracy + precision + recall y se promedian sus probabilidades para la predicción.
-4. **Córners – 5 modelos** de regresión del total (Ridge, Random Forest, Extra Trees, Gradient
-   Boosting Poisson, MLP). La media predicha se convierte en probabilidad de over/under por línea
-   (6.5 … 13.5) con una binomial negativa cuya dispersión se calibra out-of-fold. Cada modelo se
-   evalúa como clasificador over/under en las líneas 7.5–11.5 y se eligen los **2 mejores**.
+3. **Tres bloques por fecha, sin mezclar**: entrenamiento (70 % más antiguo, se ajustan los modelos),
+   validación (15 % siguiente, se eligen los 2 mejores y se calibra el over/under) y prueba (15 % más
+   reciente, solo se mide). Para cada modelo se reportan las métricas en los tres bloques, así se ve
+   si está sobreajustando. Los modelos que predicen se reajustan después con todos los partidos.
+4. **5 modelos por tarea**. Resultado 1X2: Regresión Logística, Random Forest, Extra Trees, Gradient
+   Boosting y Red Neuronal, con accuracy, precision, recall, F1 y log-loss. Goles, tiros al arco y
+   córners: Ridge, Random Forest, Extra Trees, Gradient Boosting Poisson y Red Neuronal, con MAE y
+   RMSE del total, más accuracy, precision, recall y F1 del over/under (binomial negativa). En cada
+   tarea se promedian los **2 mejores**.
 5. **Predicción del partido**: probabilidades 1X2 + ganador/perdedor; total esperado de córners,
    P(over)/P(under) por línea con su accuracy/precisión histórica, y la **recomendación OVER con la
    línea más alta** cuya probabilidad supera la confianza (`--conf`), mostrando la precisión que esa
    señal tuvo en el backtest (para no "ganar" córners a costa de precisión).
+
+## Métricas
+
+Las métricas completas de entrenamiento, validación y prueba están en [METRICS.md](METRICS.md).
+También se ven en la terminal y en la pestaña «Rendimiento de los modelos» de la página web.
+Para regenerar el archivo con los datos del día:
+
+```bash
+./.venv/bin/python report.py
+```
 
 ## Goles y tiros al arco
 

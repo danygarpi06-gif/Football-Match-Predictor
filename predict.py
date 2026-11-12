@@ -14,14 +14,11 @@ import difflib
 import sys
 
 import numpy as np
-import pandas as pd
+import pandas as pd  # noqa: F401
 
 from fmp.data import LEAGUES, current_teams, load_league, upcoming_fixtures
-from fmp.features import build_training_frame, feature_matrix
-from fmp.pipeline import TARGETS, count_predict, fit_count_target
-from fmp.models import (CORNER_LINES, OUTCOME_LABELS, corner_ensemble_backtest, evaluate_corner_models,
-                        evaluate_outcome_models, fit_corner_ensemble, fit_outcome_ensemble, outcome_metrics_table,
-                        predict_corners, predict_outcome, prob_over, time_split)
+from fmp.models import ENSEMBLE, OUTCOME_LABELS, SPLITS
+from fmp.pipeline import TARGETS, outcome_view, predict, train
 
 LINE = "─" * 78
 
@@ -86,14 +83,14 @@ def match_team(name: str, teams: list[str]) -> str:
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Predicción 1X2 y tiros de esquina (over/under)")
+    ap = argparse.ArgumentParser(description="Predicción 1X2, goles, tiros al arco y tiros de esquina (over/under)")
     ap.add_argument("--league", choices=list(LEAGUES), help="liga a analizar")
     ap.add_argument("--home", help="equipo local")
     ap.add_argument("--away", help="equipo visitante")
     ap.add_argument("--neutral", action="store_true", help="cancha neutral (p.ej. final de Champions)")
     ap.add_argument("--scope", choices=["all", "league"], default="all",
                     help="entrenar con las 7 ligas juntas (all, default, más preciso) o solo con la liga elegida (league, más rápido)")
-    ap.add_argument("--conf", type=float, default=0.60, help="confianza mínima para recomendar una línea de córners")
+    ap.add_argument("--conf", type=float, default=0.60, help="confianza mínima para recomendar una línea over/under")
     ap.add_argument("--start", default="2022-07", help="mes inicial del histórico (YYYY-MM)")
     ap.add_argument("--source", choices=["auto", "espn", "fdcouk"], default="auto", help="fuente de datos")
     ap.add_argument("--refresh", action="store_true", help="ignorar caché y volver a descargar todo")
@@ -154,80 +151,53 @@ def main() -> None:
     print(f"\nPartido: {home} (local) vs {away} (visitante)  |  fecha usada: {kickoff:%Y-%m-%d}"
           f"{'  |  cancha neutral' if neutral else ''}")
 
-    # ---- features --------------------------------------------------------- #
-    all_matches = pd.concat(data.values(), ignore_index=True)
-    frame, builders = build_training_frame(all_matches)
-    X_all = feature_matrix(frame, leagues_to_load)
-    y_out = frame["y_outcome"].astype(int)
-    split = time_split(len(frame))
-    test_rows = frame.iloc[split:]
+    # ---- training + evaluation -------------------------------------------- #
     scope_txt = "las 7 ligas" if args.scope == "all" else LEAGUES[league]["name"]
-    print(f"Dataset de entrenamiento ({scope_txt}): {len(frame)} partidos, {X_all.shape[1]} variables | "
-          f"entrenamiento: {split}  prueba (más recientes): {len(frame) - split} "
-          f"({test_rows['date'].min():%Y-%m-%d} → {test_rows['date'].max():%Y-%m-%d})")
+    hr(f"3) Entrenamiento y evaluación ({scope_txt})")
+    print("Entrenando 5 modelos por tarea (resultado, goles, tiros al arco, córners)...")
+    tr = train(data, seed=args.seed)
+    print(f"\n{tr['n_matches']} partidos ordenados por fecha, {tr['n_features']} variables, tres bloques:")
+    uses = {"train": "ajustar los modelos", "val": "elegir los 2 mejores y calibrar el over/under",
+            "test": "solo medir (no interviene en ninguna decisión)"}
+    for sp, name in SPLITS.items():
+        b = tr["splits"][sp]
+        print(f"  {name:<14}{b['n']:>6} partidos  {b['desde']:%Y-%m-%d} → {b['hasta']:%Y-%m-%d}   {uses[sp]}")
+    print("Si un modelo rinde mucho mejor en Entrenamiento que en Prueba, está sobreajustando. La cifra honesta es Prueba.")
 
-    # ---- outcome models --------------------------------------------------- #
-    hr("3) Resultado del partido (1X2): 5 modelos evaluados en los partidos más recientes")
-    table, preds = evaluate_outcome_models(X_all, y_out, split, seed=args.seed)
-    yte = y_out.iloc[split:].to_numpy()
+    def print_metrics(df: pd.DataFrame, cols: list[str]) -> None:
+        print(f"{'Modelo':<29}{'Conjunto':<15}" + "".join(f"{c:>10}" for c in cols))
+        for i, row in enumerate(df.to_dict("records")):
+            if i and i % 3 == 0:
+                print()
+            cells = "".join(f"{row[c.lower() if c not in ('MAE', 'RMSE') else c]:>10.3f}" if c in ("MAE", "RMSE", "log_loss")
+                            else f"{pct(row[c.lower()]):>10}" for c in cols)
+            print(f"{row['modelo']:<29}{row['conjunto']:<15}{cells}")
 
-    def print_outcome_table(tab: pd.DataFrame, y_ref: np.ndarray, title: str) -> None:
-        base = pd.Series(y_ref).value_counts(normalize=True).max()
-        print(f"{title} (n={len(y_ref)}, baseline clase mayoritaria = {pct(base).strip()})")
-        print(f"{'Modelo':<22}{'Accuracy':>10}{'Precision':>11}{'Recall':>9}{'F1':>8}{'LogLoss':>10}{'Score':>8}")
-        for r in tab.itertuples():
-            print(f"{r.modelo:<22}{pct(r.accuracy):>10}{pct(r.precision):>11}{pct(r.recall):>9}{pct(r.f1):>8}{r.log_loss:>10.3f}{pct(r.score):>8}")
-
-    print_outcome_table(table, yte, f"Métricas en prueba - {scope_txt}")
-    print("(Precision/Recall = macro sobre las 3 clases; Score = promedio de accuracy, precision y recall)")
-    league_mask = (test_rows["league"] == league).to_numpy()
-    if args.scope == "all" and league_mask.sum() >= 30:
-        print()
-        print_outcome_table(outcome_metrics_table(preds, yte, league_mask), yte[league_mask],
-                            f"Mismos modelos, solo partidos de {LEAGUES[league]['name']}")
-    top2 = table["modelo"].head(2).tolist()
-    print(f"\n>>> TOP 2 modelos 1X2: {top2[0]}  y  {top2[1]}  (se promedian sus probabilidades)")
-
-    # ---- corner models ---------------------------------------------------- #
-    has_corners = frame["y_corners"].notna()
-    corner_ok = has_corners.sum() >= 300
-    if corner_ok:
-        hr("4) Tiros de esquina totales: 5 modelos (over/under evaluado en líneas 7.5 a 11.5)")
-        fc = frame[has_corners].reset_index(drop=True)
-        Xc = feature_matrix(fc, leagues_to_load)
-        yc = fc["y_corners"].astype(float)
-        splitc = time_split(len(fc))
-        ctable, cinfo = evaluate_corner_models(Xc, yc, splitc, seed=args.seed)
-        print(f"{'Modelo':<28}{'MAE':>7}{'Accuracy':>10}{'Precision':>11}{'Recall':>9}{'Score':>8}")
-        for r in ctable.itertuples():
-            print(f"{r.modelo:<28}{r.MAE:>7.2f}{pct(r.accuracy):>10}{pct(r.precision):>11}{pct(r.recall):>9}{pct(r.score):>8}")
-        ctop2 = ctable["modelo"].head(2).tolist()
-        print(f"\n>>> TOP 2 modelos de córners: {ctop2[0]}  y  {ctop2[1]}  (se promedia su media esperada)")
-        cmask = (fc.iloc[splitc:]["league"] == league).to_numpy()
-        use_mask = cmask if (args.scope == "all" and cmask.sum() >= 80) else None
-        bt, alpha = corner_ensemble_backtest(ctop2, cinfo, yc.iloc[:splitc].to_numpy(), yc.iloc[splitc:].to_numpy(),
-                                             args.conf, mask=use_mask)
-        yte_c = yc.iloc[splitc:].to_numpy()[use_mask] if use_mask is not None else yc.iloc[splitc:].to_numpy()
-        print(f"\nBacktest del ensamble en {LEAGUES[league]['name'] if use_mask is not None else scope_txt} "
-              f"(n={len(yte_c)} partidos de prueba, media real {yte_c.mean():.2f} córners):")
-        print(f"{'Línea':>6}{'%Over real':>12}{'Accuracy':>10}{'Prec.Over':>11}{'Rec.Over':>10}{'Prec.Under':>12}{'Rec.Under':>11}{f'Señal≥{args.conf:.0%}':>12}{'Prec.señal':>12}")
-        for r in bt.itertuples():
-            print(f"{r.linea:>6}{pct(r.pct_over_real):>12}{pct(r.accuracy):>10}{pct(r.precision_over):>11}{pct(r.recall_over):>10}"
-                  f"{pct(r.precision_under):>12}{pct(r.recall_under):>11}{r.senal_n:>12}{pct(r.senal_precision):>12}")
-        print("('Señal' = partidos de prueba donde el modelo dio P(over) ≥ confianza; 'Prec.señal' = % que realmente fue over)")
-    else:
-        print("\n(La fuente actual no trae tiros de esquina suficientes para esta liga; se omite el modelo de córners)")
+    hr("3a) Resultado 1X2: precision, recall y F1 son macro sobre las 3 clases")
+    print_metrics(tr["metrics"], ["Accuracy", "Precision", "Recall", "F1", "log_loss"])
+    print(f"\n>>> TOP 2 (elegidos en Validación): {tr['top2'][0]}  y  {tr['top2'][1]}. '{ENSEMBLE}' promedia ambos y es lo que predice.")
+    ov = outcome_view(tr, league)
+    if ov["league_specific"] and args.scope == "all":
+        r = ov["table"][ov["table"]["modelo"] == ENSEMBLE].iloc[0]
+        print(f"    {ENSEMBLE} en Prueba, solo {LEAGUES[league]['name']} (n={ov['n']}): accuracy {pct(r['accuracy']).strip()}, "
+              f"precision {pct(r['precision']).strip()}, recall {pct(r['recall']).strip()}, F1 {pct(r['f1']).strip()}")
+    for i, (key, ct) in enumerate(tr["counts"].items()):
+        t = TARGETS[key]
+        if ct is None:
+            print(f"\n({t['label']}: la fuente actual no trae este dato para esta liga)")
+            continue
+        hr(f"3{'bcd'[i]}) {t['label']}: MAE y RMSE en {t['unit']} por partido; el resto es over/under en líneas {t['rank'][0]} a {t['rank'][-1]}")
+        print_metrics(ct["metrics"], ["MAE", "RMSE", "Accuracy", "Precision", "Recall", "F1"])
+        print(f"\n>>> TOP 2 (elegidos en Validación): {ct['top2'][0]}  y  {ct['top2'][1]}")
 
     # ---- final prediction ------------------------------------------------- #
-    hr(f"5) PREDICCIÓN: {home} vs {away}")
-    fb = builders[league]
-    if fb.hist[home] == [] or fb.hist[away] == []:
-        sys.exit("No hay historial suficiente para uno de los equipos.")
-    feats = fb.features(home, away, kickoff, neutral)
-    x = feature_matrix(pd.DataFrame([{**feats, "league": league}]), leagues_to_load).reindex(columns=X_all.columns)
-    models = fit_outcome_ensemble(top2, X_all, y_out, seed=args.seed)
-    proba = predict_outcome(models, x)
-    print(f"Elo: {home} {fb.elo[home]:.0f}  |  {away} {fb.elo[away]:.0f}   "
+    hr(f"4) PREDICCIÓN: {home} vs {away}")
+    try:
+        res = predict(tr, league, home, away, kickoff, neutral, args.conf)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    proba, feats = res["proba"], res["feats"]
+    print(f"Elo: {home} {res['elo_home']:.0f}  |  {away} {res['elo_away']:.0f}   "
           f"Forma (pts/partido últimos 5): {home} {feats['h_pts_s']:.2f} | {away} {feats['a_pts_s']:.2f}")
     print(f"\n  Gana {home:<24} {pct(proba[0])}")
     print(f"  Empate{'':<23} {pct(proba[1])}")
@@ -240,59 +210,23 @@ def main() -> None:
     p_no_draw = proba[0] / (proba[0] + proba[2])
     print(f"    Si descartamos el empate: {home} {pct(p_no_draw).strip()} vs {away} {pct(1 - p_no_draw).strip()}")
 
-    if corner_ok:
-        cmodels = fit_corner_ensemble(ctop2, Xc, yc, seed=args.seed)
-        xc = x[Xc.columns]
-        mu = predict_corners(cmodels, xc)
-        print(f"\nTIROS DE ESQUINA - total esperado: {mu:.2f}  (promedio últimos 10: {home} {feats['h_cf_l']:.1f} a favor / "
-              f"{feats['h_ca_l']:.1f} en contra; {away} {feats['a_cf_l']:.1f} / {feats['a_ca_l']:.1f})")
-        print(f"{'Línea':>6}{'P(Over)':>10}{'P(Under)':>10}{'Veredicto':>12}{'Acc. hist.':>12}{'Prec. hist.':>13}")
-        best_over = best_under = None
-        for L in CORNER_LINES:
-            po = float(prob_over(np.array([mu]), alpha, L)[0])
-            row = bt[bt["linea"] == L].iloc[0]
-            verdict = "OVER" if po >= 0.5 else "UNDER"
-            prec_hist = row["precision_over"] if po >= 0.5 else row["precision_under"]
-            print(f"{L:>6}{pct(po):>10}{pct(1 - po):>10}{verdict:>12}{pct(row['accuracy']):>12}{pct(prec_hist):>13}")
-            if po >= args.conf:
-                best_over = (L, po, row)
-            if (1 - po) >= args.conf and best_under is None:
-                best_under = (L, 1 - po, row)
-        print()
-        if best_over:
-            L, po, row = best_over
-            print(f">>> RECOMENDACIÓN OVER (línea más alta con P ≥ {args.conf:.0%}): MÁS DE {L} córners  "
-                  f"— prob. {po:.0%} | histórico de esta señal: precisión {pct(row['senal_precision']).strip()} "
-                  f"(n={int(row['senal_n'])}), accuracy de la línea {pct(row['accuracy']).strip()}, recall over {pct(row['recall_over']).strip()}")
-        else:
-            print(f">>> Ninguna línea OVER alcanza la confianza {args.conf:.0%}; la más probable es OVER "
-                  f"{max(CORNER_LINES, key=lambda L: float(prob_over(np.array([mu]), alpha, L)[0]) if float(prob_over(np.array([mu]), alpha, L)[0]) >= 0.5 else -1)}")
-        if best_under:
-            L, pu, row = best_under
-            print(f">>> RECOMENDACIÓN UNDER (línea más baja con P ≥ {args.conf:.0%}): MENOS DE {L} córners "
-                  f"— prob. {pu:.0%} | precisión histórica under {pct(row['precision_under']).strip()}, recall under {pct(row['recall_under']).strip()}")
-    # ---- goals and shots on target (same method as corners) --------------- #
-    for key in ("goals", "sot"):
-        t = TARGETS[key]
-        ct = fit_count_target(frame, leagues_to_load, key, seed=args.seed)
-        if ct is None:
-            print(f"\n({t['label']}: la fuente actual no trae este dato para esta liga)")
-            continue
-        r = count_predict(ct, x, league, args.conf)
-        top = ct["table"].head(2)
+    for key, r in res["counts"].items():
+        t, v = TARGETS[key], r["view"]
+        where = LEAGUES[league]["name"] if v["league_specific"] else scope_txt
         print(f"\n{t['label'].upper()} - total esperado: {r['mu']:.2f}  ({home} {r['mu_home']:.2f} | {away} {r['mu_away']:.2f})")
-        print("    TOP 2 modelos: " + "  y  ".join(
-            f"{m.modelo} (acc {pct(m.accuracy).strip()}, prec {pct(m.precision).strip()}, rec {pct(m.recall).strip()})" for m in top.itertuples()))
-        print(f"{'Línea':>6}{'P(Over)':>10}{'P(Under)':>10}{'Veredicto':>12}{'Acc. hist.':>12}{'Prec. hist.':>13}{'Rec. hist.':>12}")
+        print(f"    Métricas históricas de cada línea: bloque de Prueba en {where} (n={v['n']}, promedio real {v['mean_real']:.2f})")
+        print(f"{'Línea':>6}{'P(Over)':>10}{'P(Under)':>10}{'Veredicto':>11}{'Accuracy':>10}{'Precision':>11}{'Recall':>9}{'F1':>8}")
         for row in r["lines"].itertuples(index=False):
-            print(f"{row[0]:>6}{pct(row[1]):>10}{pct(row[2]):>10}{row[3]:>12}{pct(row[4]):>12}{pct(row[5]):>13}{pct(row[6]):>12}")
+            print(f"{row[0]:>6}{pct(row[1]):>10}{pct(row[2]):>10}{row[3]:>11}{pct(row[4]):>10}{pct(row[5]):>11}{pct(row[6]):>9}{pct(row[7]):>8}")
         bo, bu = r["best_over"], r["best_under"]
         if bo:
-            print(f">>> OVER recomendado: MÁS DE {bo['linea']} {t['unit']} — prob. {bo['prob']:.0%} | "
-                  f"precisión histórica de la señal {pct(bo['precision']).strip()} (n={bo['n']})")
+            print(f">>> OVER recomendado (línea más alta con P ≥ {args.conf:.0%}): MÁS DE {bo['linea']} {t['unit']} — prob. {bo['prob']:.0%} | "
+                  f"esta señal acertó {pct(bo['precision']).strip()} en Prueba (n={bo['n']}), recall {pct(bo['recall']).strip()}, F1 {pct(bo['f1']).strip()}")
+        else:
+            print(f">>> Ninguna línea OVER alcanza la confianza {args.conf:.0%}")
         if bu:
-            print(f">>> UNDER recomendado: MENOS DE {bu['linea']} {t['unit']} — prob. {bu['prob']:.0%} | "
-                  f"precisión histórica under {pct(bu['precision']).strip()}")
+            print(f">>> UNDER recomendado (línea más baja con P ≥ {args.conf:.0%}): MENOS DE {bu['linea']} {t['unit']} — prob. {bu['prob']:.0%} | "
+                  f"precisión {pct(bu['precision']).strip()}, recall {pct(bu['recall']).strip()}, F1 {pct(bu['f1']).strip()}")
     print()
 
 
