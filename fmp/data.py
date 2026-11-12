@@ -260,4 +260,4 @@ def current_teams(df: pd.DataFrame, days: int = 200) -> list[str]:
 def upcoming_fixtures(df: pd.DataFrame, days: int = 14) -> pd.DataFrame:
     now = pd.Timestamp.now("UTC").tz_convert(None)
     mask = (df["status"] == "SCHED") & (df["date"] >= now - pd.Timedelta(hours=3)) & (df["date"] <= now + pd.Timedelta(days=days))
-    return df.loc[mask, ["date", "home", "away", "neutral"]].sort_values("date").reset_index(drop=True)
+    return df.loc[mask, ["date", "home", "away", "neutral", "match_id"]].sort_values("date").reset_index(drop=True)

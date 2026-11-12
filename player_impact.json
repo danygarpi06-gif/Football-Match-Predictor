@@ -1,0 +1,162 @@
+[
+ {
+  "tarea":"Resultado 1X2",
+  "conjunto":"Validación",
+  "datos":"Solo equipos",
+  "accuracy":0.5272601794,
+  "f1":0.4064870662,
+  "log_loss":0.988114136,
+  "MAE":null,
+  "RMSE":null
+ },
+ {
+  "tarea":"Resultado 1X2",
+  "conjunto":"Validación",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.5293305728,
+  "f1":0.4039901158,
+  "log_loss":0.987873992,
+  "MAE":null,
+  "RMSE":null
+ },
+ {
+  "tarea":"Resultado 1X2",
+  "conjunto":"Prueba",
+  "datos":"Solo equipos",
+  "accuracy":0.5127674258,
+  "f1":0.3905110076,
+  "log_loss":1.0002017751,
+  "MAE":null,
+  "RMSE":null
+ },
+ {
+  "tarea":"Resultado 1X2",
+  "conjunto":"Prueba",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.5058661146,
+  "f1":0.3830158538,
+  "log_loss":0.9988595686,
+  "MAE":null,
+  "RMSE":null
+ },
+ {
+  "tarea":"Goles",
+  "conjunto":"Validación",
+  "datos":"Solo equipos",
+  "accuracy":0.679779158,
+  "f1":0.5126769975,
+  "log_loss":null,
+  "MAE":1.2912362838,
+  "RMSE":1.6229747957
+ },
+ {
+  "tarea":"Goles",
+  "conjunto":"Validación",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6859903382,
+  "f1":0.520355939,
+  "log_loss":null,
+  "MAE":1.2868117063,
+  "RMSE":1.6172812486
+ },
+ {
+  "tarea":"Goles",
+  "conjunto":"Prueba",
+  "datos":"Solo equipos",
+  "accuracy":0.677478721,
+  "f1":0.5119174644,
+  "log_loss":null,
+  "MAE":1.3371309792,
+  "RMSE":1.6832942844
+ },
+ {
+  "tarea":"Goles",
+  "conjunto":"Prueba",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6827697262,
+  "f1":0.527896433,
+  "log_loss":null,
+  "MAE":1.3344443598,
+  "RMSE":1.6767437802
+ },
+ {
+  "tarea":"Tiros al arco",
+  "conjunto":"Validación",
+  "datos":"Solo equipos",
+  "accuracy":0.6720496894,
+  "f1":0.4824142305,
+  "log_loss":null,
+  "MAE":2.4027244878,
+  "RMSE":3.0514931368
+ },
+ {
+  "tarea":"Tiros al arco",
+  "conjunto":"Validación",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6731538992,
+  "f1":0.4839016069,
+  "log_loss":null,
+  "MAE":2.3945544459,
+  "RMSE":3.0486577863
+ },
+ {
+  "tarea":"Tiros al arco",
+  "conjunto":"Prueba",
+  "datos":"Solo equipos",
+  "accuracy":0.6571428571,
+  "f1":0.521217417,
+  "log_loss":null,
+  "MAE":2.6193384852,
+  "RMSE":3.2694156171
+ },
+ {
+  "tarea":"Tiros al arco",
+  "conjunto":"Prueba",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6583850932,
+  "f1":0.5298650799,
+  "log_loss":null,
+  "MAE":2.6027814995,
+  "RMSE":3.2463187282
+ },
+ {
+  "tarea":"Tiros de esquina",
+  "conjunto":"Validación",
+  "datos":"Solo equipos",
+  "accuracy":0.6472049689,
+  "f1":0.4537465512,
+  "log_loss":null,
+  "MAE":2.6869457823,
+  "RMSE":3.4082154178
+ },
+ {
+  "tarea":"Tiros de esquina",
+  "conjunto":"Validación",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6512077295,
+  "f1":0.4222576068,
+  "log_loss":null,
+  "MAE":2.6759839332,
+  "RMSE":3.3774357156
+ },
+ {
+  "tarea":"Tiros de esquina",
+  "conjunto":"Prueba",
+  "datos":"Solo equipos",
+  "accuracy":0.6340924776,
+  "f1":0.5232999438,
+  "log_loss":null,
+  "MAE":2.8901664093,
+  "RMSE":3.5847527591
+ },
+ {
+  "tarea":"Tiros de esquina",
+  "conjunto":"Prueba",
+  "datos":"Equipos + jugadores",
+  "accuracy":0.6432022084,
+  "f1":0.4910419413,
+  "log_loss":null,
+  "MAE":2.8466880994,
+  "RMSE":3.5332792074
+ }
+]

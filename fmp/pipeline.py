@@ -10,6 +10,7 @@ import pandas as pd
 
 from .data import LEAGUES, load_league
 from .features import build_training_frame, feature_matrix
+from .players import STARTER, fetch_lineup, load_lineups
 from .models import (CORNER_LINES, ENSEMBLE, RANK_LINES, SPLITS, evaluate_count_models, evaluate_outcome_models,
                      fit_corner_ensemble, fit_outcome_ensemble, line_metrics, outcome_table, predict_corners,
                      predict_outcome, prob_over, split_masks, three_way_split)
@@ -57,16 +58,29 @@ def fit_count_target(frame: pd.DataFrame, leagues: list[str], key: str, seed: in
     }
 
 
-def train(data: dict[str, pd.DataFrame], seed: int = 42) -> dict:
+def load_players(data: dict[str, pd.DataFrame], refresh: bool = False, verbose: bool = False) -> dict:
+    """Line-ups and player stats of every finished match (empty when ESPN is unreachable)."""
+    try:
+        return load_lineups(data, refresh=refresh, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"  Sin datos de jugadores ({exc}); se usan solo datos de equipo.")
+        return {"matches": {}, "names": {}}
+
+
+def train(data: dict[str, pd.DataFrame], seed: int = 42, players: dict | None = None) -> dict:
     """Evaluate every model on train / validation / test and refit the top-2 of each task on everything."""
     leagues = list(data)
-    frame, builders = build_training_frame(pd.concat(data.values(), ignore_index=True))
+    players = players or {"matches": {}, "names": {}}
+    frame, builders, book = build_training_frame(pd.concat(data.values(), ignore_index=True), players["matches"])
     X = feature_matrix(frame, leagues)
     y = frame["y_outcome"].astype(int)
     i_val, i_test = three_way_split(len(frame))
     ev = evaluate_outcome_models(X, y, i_val, i_test, seed=seed)
     return {
         "leagues": leagues, "builders": builders, "n_matches": len(frame), "n_features": X.shape[1],
+        "book": book, "names": {int(k): v for k, v in players["names"].items()},
+        "n_lineups": int(frame["h_xi_g"].notna().sum()) if book else 0,
         "last_match": frame["date"].max(), "splits": _split_info(frame["date"], i_val, i_test),
         "columns": list(X.columns), "metrics": ev["metrics"], "preds": ev["preds"], "top2": ev["top2"],
         "y": y.to_numpy(), "league": frame["league"].to_numpy(), "i_test": i_test,
@@ -127,15 +141,84 @@ def count_predict(ct: dict, x: pd.DataFrame, league: str, conf: float) -> dict:
             "best_over": best_over, "best_under": best_under, "view": view}
 
 
-def predict(tr: dict, league: str, home: str, away: str, kickoff: pd.Timestamp, neutral: bool, conf: float) -> dict:
+def confirmed_lineup(league: str, match_id: str) -> dict | None:
+    """Starting XIs that ESPN has already published for a match (usually about one hour before kick-off)."""
+    try:
+        rec, names = fetch_lineup(league, str(match_id))
+    except Exception:  # noqa: BLE001
+        return None
+    if not rec:
+        return None
+    return {"h": [pl[0] for pl in rec["h"]["p"] if pl[1] == STARTER],
+            "a": [pl[0] for pl in rec["a"]["p"] if pl[1] == STARTER], "names": {int(k): v for k, v in names.items()}}
+
+
+def team_players(tr: dict, league: str, team: str) -> dict | None:
+    """Usual XI and recent squad of a team (player ids), or None when there is no player data."""
+    book = tr["book"]
+    tid = book.team_id.get((league, team)) if book else None
+    if not tid:
+        return None
+    usual = book.usual_xi(tid)
+    return {"tid": tid, "usual": usual, "squad": book.squad(tid)} if len(usual) == 11 else None
+
+
+def without_players(tr: dict, league: str, team: str, out: list[int]) -> list[int]:
+    """Usual XI with some players removed; each one is replaced by the most used squad player of his line."""
+    tp, book = team_players(tr, league, team), tr["book"]
+    xi = list(tp["usual"])
+    for pid in out:
+        if pid not in xi:
+            continue
+        pool = [c for c in tp["squad"] if c not in xi and c not in out]
+        same = [c for c in pool if book.p[c]["grp"] == book.p[pid]["grp"]]
+        outfield = [c for c in pool if book.p[c]["grp"] != "G"]
+        pick = (same or (pool if book.p[pid]["grp"] == "G" else outfield) or pool or [None])[0]
+        if pick is not None:
+            xi[xi.index(pid)] = pick
+    return xi
+
+
+GROUPS = {"G": "Portero", "D": "Defensa", "M": "Medio", "F": "Delantero", "U": "Sin dato"}
+
+
+def player_table(tr: dict, league: str, team: str, xi: list[int]) -> pd.DataFrame:
+    """What the model knows about each starter (recency-weighted, per match started)."""
+    book, tp = tr["book"], team_players(tr, league, team)
+    _, share = book.start_scores(tp["tid"])
+    rows = []
+    for pid in xi:
+        g, a, sh, sot = book._rates(pid)
+        st = book.p.get(pid, {"grp": "U", "r": 0.0, "n": 0})
+        rows.append({"Jugador": tr["names"].get(pid, str(pid)), "Posición": GROUPS[st["grp"]],
+                     "Titular reciente": share.get(pid, 0.0), "Partidos": st["n"], "Goles": g, "Asistencias": a,
+                     "Tiros": sh, "Tiros al arco": sot, "Rating": st["r"]})
+    order = {v: i for i, v in enumerate(GROUPS.values())}
+    return pd.DataFrame(rows).sort_values("Posición", key=lambda c: c.map(order), kind="stable").reset_index(drop=True)
+
+
+def predict(tr: dict, league: str, home: str, away: str, kickoff: pd.Timestamp, neutral: bool, conf: float,
+            home_xi: list[int] | None = None, away_xi: list[int] | None = None) -> dict:
+    """home_xi / away_xi: 11 player ids each. When omitted, the usual XI of each team is used."""
     fb = tr["builders"][league]
     if not fb.hist[home] or not fb.hist[away]:
         raise ValueError("No hay historial suficiente para uno de los equipos.")
-    feats = fb.features(home, away, kickoff, neutral)
+    xi, usual = {}, {}
+    for side, team, chosen in (("h", home, home_xi), ("a", away, away_xi)):
+        tp = team_players(tr, league, team)
+        usual[side] = tp["usual"] if tp else None
+        ids = chosen if chosen and len(chosen) == 11 and tp else usual[side]
+        if ids:
+            xi[side] = [(pid, "") for pid in ids]
+    feats = fb.features(home, away, kickoff, neutral, xi)
     x = feature_matrix(pd.DataFrame([{**feats, "league": league}]), tr["leagues"])
     proba = predict_outcome(tr["models"], x.reindex(columns=tr["columns"]))
-    return {"proba": proba, "feats": feats, "elo_home": fb.elo[home], "elo_away": fb.elo[away],
-            "counts": {k: count_predict(ct, x, league, conf) for k, ct in tr["counts"].items() if ct}}
+    res = {"proba": proba, "feats": feats, "elo_home": fb.elo[home], "elo_away": fb.elo[away],
+           "counts": {k: count_predict(ct, x, league, conf) for k, ct in tr["counts"].items() if ct},
+           "xi": {s: [pid for pid, _ in v] for s, v in xi.items()}, "usual": usual, "base": None}
+    if any(s in xi and set(res["xi"][s]) != set(usual[s]) for s in ("h", "a")):
+        res["base"] = predict(tr, league, home, away, kickoff, neutral, conf)  # same match with the usual XIs
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +226,7 @@ def predict(tr: dict, league: str, home: str, away: str, kickoff: pd.Timestamp, 
 # --------------------------------------------------------------------------- #
 PCT = ("accuracy", "precision", "recall", "f1", "score", "pct_over_real", "precision_over", "recall_over",
        "f1_over", "precision_under", "recall_under", "f1_under", "senal_precision")
-HEADERS = {"modelo": "Modelo", "conjunto": "Conjunto", "accuracy": "Accuracy", "precision": "Precision",
+HEADERS = {"modelo": "Modelo", "conjunto": "Conjunto", "tarea": "Tarea", "datos": "Datos", "accuracy": "Accuracy", "precision": "Precision",
            "recall": "Recall", "f1": "F1", "log_loss": "Log-loss", "score": "Score", "linea": "Línea",
            "pct_over_real": "% over real", "precision_over": "Prec. over", "recall_over": "Recall over",
            "f1_over": "F1 over", "precision_under": "Prec. under", "recall_under": "Recall under",
@@ -167,7 +250,30 @@ def _md(df: pd.DataFrame) -> str:
     return "\n".join(out)
 
 
-def metrics_markdown(tr: dict, conf: float = 0.60) -> str:
+def player_impact(tr: dict, base: dict) -> pd.DataFrame:
+    """Top-2 ensemble with and without player data, on validation and test."""
+    tasks = [("Resultado 1X2", tr["metrics"], base["metrics"])]
+    tasks += [(TARGETS[k]["label"], tr["counts"][k]["metrics"], base["counts"][k]["metrics"])
+              for k in TARGETS if tr["counts"][k] and base["counts"][k]]
+    rows = []
+    for label, with_players, team_only in tasks:
+        for split in ("val", "test"):
+            for name, m in (("Solo equipos", team_only), ("Equipos + jugadores", with_players)):
+                r = m[(m["modelo"] == ENSEMBLE) & (m["conjunto"] == SPLITS[split])].iloc[0]
+                rows.append({"tarea": label, "conjunto": SPLITS[split], "datos": name, "accuracy": r["accuracy"],
+                             "f1": r["f1"], "log_loss": r.get("log_loss", np.nan), "MAE": r.get("MAE", np.nan),
+                             "RMSE": r.get("RMSE", np.nan)})
+    return pd.DataFrame(rows)
+
+
+PLAYERS_TEXT = ("Además de los datos de equipo, cada partido usa su **alineación titular**. De cada jugador se "
+                "llevan goles, asistencias, tiros y tiros al arco por partido de titular, con más peso en lo reciente, "
+                "y un rating que sube cuando el equipo rinde mejor de lo esperado con él en cancha. El once se resume "
+                "en la suma de sus jugadores y se compara con el once habitual del equipo, para medir bajas y rotaciones. "
+                "Todo se calcula solo con partidos anteriores.")
+
+
+def metrics_markdown(tr: dict, conf: float = 0.60, impact: pd.DataFrame | None = None) -> str:
     sp = tr["splits"]
     L = ["# Métricas de los modelos", "",
          f"Generado con datos hasta el {tr['last_match']:%d/%m/%Y}. {tr['n_matches']:,} partidos de las 7 ligas, "
@@ -181,8 +287,14 @@ def metrics_markdown(tr: dict, conf: float = 0.60) -> str:
         L.append(f"| {name} | {sp[k]['n']:,} | {sp[k]['desde']:%d/%m/%Y} | {sp[k]['hasta']:%d/%m/%Y} | {uses[k]} |")
     L += ["", "Si un modelo rinde mucho mejor en entrenamiento que en prueba, está memorizando (sobreajuste). "
           "La cifra honesta es la de **Prueba**. Los modelos que predicen partidos futuros se vuelven a ajustar "
-          "con todos los partidos.", "",
-          "## Resultado del partido (1X2)", "",
+          "con todos los partidos.", ""]
+    if tr["book"]:
+        L += ["## Datos de jugadores y alineaciones", "",
+              f"{PLAYERS_TEXT} Hay alineación en {tr['n_lineups']:,} de los {tr['n_matches']:,} partidos.", ""]
+        if impact is not None:
+            L += ["Comparación de «" + ENSEMBLE + "» entrenando sin y con los datos de jugadores. En accuracy y F1 "
+                  "más alto es mejor; en log-loss, MAE y RMSE más bajo es mejor.", "", _md(impact), ""]
+    L += ["## Resultado del partido (1X2)", "",
           f"Mejores dos en validación: **{tr['top2'][0]}** y **{tr['top2'][1]}**. "
           f"«{ENSEMBLE}» es el promedio de ambos y es lo que usa la predicción. "
           "Precision, recall y F1 son el promedio de las tres clases (local, empate, visitante).", "",

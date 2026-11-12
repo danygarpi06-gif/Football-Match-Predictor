@@ -6,6 +6,7 @@ Ejemplos:
   python predict.py --league premier_league --home Arsenal --away Chelsea
   python predict.py --league liga_mx --list-teams
   python predict.py --league champions --home "Real Madrid" --away "Bayern" --scope all --conf 0.65
+  python predict.py --league la_liga --home "Real Madrid" --away Barcelona --home-out "Mbappé,Vinícius"
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ import pandas as pd  # noqa: F401
 
 from fmp.data import LEAGUES, current_teams, load_league, upcoming_fixtures
 from fmp.models import ENSEMBLE, OUTCOME_LABELS, SPLITS
-from fmp.pipeline import TARGETS, outcome_view, predict, train
+from fmp.pipeline import (TARGETS, confirmed_lineup, load_players, outcome_view, player_table, predict, team_players,
+                          train, without_players)
 
 LINE = "─" * 78
 
@@ -81,6 +83,22 @@ def match_team(name: str, teams: list[str]) -> str:
     sys.exit(f"Equipo no encontrado: '{name}'. Usa --list-teams para ver los nombres disponibles.")
 
 
+def match_players(raw: str | None, tr: dict, league: str, team: str) -> list[int]:
+    """Comma-separated player names -> ids of that team's squad (accents and case are ignored)."""
+    tp = team_players(tr, league, team)
+    if not raw or not tp:
+        return []
+    out = []
+    for name in (x.strip() for x in raw.split(",") if x.strip()):
+        hits = [pid for pid in tp["squad"] if _norm(name) in _norm(tr["names"].get(pid, ""))]
+        if len(hits) == 1:
+            out.append(hits[0])
+        else:
+            found = ", ".join(tr["names"].get(pid, "") for pid in hits) or "nadie"
+            print(f"  Aviso: '{name}' no identifica a un solo jugador de {team} (coincide con: {found}); se ignora.")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 def main() -> None:
     ap = argparse.ArgumentParser(description="Predicción 1X2, goles, tiros al arco y tiros de esquina (over/under)")
@@ -92,6 +110,8 @@ def main() -> None:
                     help="entrenar con las 7 ligas juntas (all, default, más preciso) o solo con la liga elegida (league, más rápido)")
     ap.add_argument("--conf", type=float, default=0.60, help="confianza mínima para recomendar una línea over/under")
     ap.add_argument("--start", default="2022-07", help="mes inicial del histórico (YYYY-MM)")
+    ap.add_argument("--home-out", help="jugadores del local que NO serán titulares, separados por coma")
+    ap.add_argument("--away-out", help="jugadores del visitante que NO serán titulares, separados por coma")
     ap.add_argument("--source", choices=["auto", "espn", "fdcouk"], default="auto", help="fuente de datos")
     ap.add_argument("--refresh", action="store_true", help="ignorar caché y volver a descargar todo")
     ap.add_argument("--list-teams", action="store_true", help="solo listar equipos de la liga y salir")
@@ -115,6 +135,8 @@ def main() -> None:
     print(f"Partidos terminados en {LEAGUES[league]['name']}: {len(finished)} "
           f"(último: {finished['date'].max():%Y-%m-%d})  | con córners: {int(finished[['hc', 'ac']].notna().all(axis=1).sum())}")
 
+    players = load_players(data, refresh=args.refresh, verbose=True)
+
     teams = current_teams(df_league)
     if args.list_teams:
         hr(f"Equipos ({len(teams)})")
@@ -122,7 +144,7 @@ def main() -> None:
         return
 
     # ---- team selection --------------------------------------------------- #
-    neutral = args.neutral
+    neutral, match_id = args.neutral, None
     kickoff = pd.Timestamp.now("UTC").tz_convert(None)
     if args.home and args.away:
         home, away = match_team(args.home, teams), match_team(args.away, teams)
@@ -148,6 +170,7 @@ def main() -> None:
     sched = df_league[(df_league["status"] == "SCHED") & (df_league["home"] == home) & (df_league["away"] == away)]
     if len(sched):
         kickoff, neutral = sched.iloc[0]["date"], bool(sched.iloc[0]["neutral"]) or neutral
+        match_id = sched.iloc[0]["match_id"]
     print(f"\nPartido: {home} (local) vs {away} (visitante)  |  fecha usada: {kickoff:%Y-%m-%d}"
           f"{'  |  cancha neutral' if neutral else ''}")
 
@@ -155,8 +178,9 @@ def main() -> None:
     scope_txt = "las 7 ligas" if args.scope == "all" else LEAGUES[league]["name"]
     hr(f"3) Entrenamiento y evaluación ({scope_txt})")
     print("Entrenando 5 modelos por tarea (resultado, goles, tiros al arco, córners)...")
-    tr = train(data, seed=args.seed)
+    tr = train(data, seed=args.seed, players=players)
     print(f"\n{tr['n_matches']} partidos ordenados por fecha, {tr['n_features']} variables, tres bloques:")
+    print(f"Partidos con alineación titular y datos de jugadores: {tr['n_lineups']}")
     uses = {"train": "ajustar los modelos", "val": "elegir los 2 mejores y calibrar el over/under",
             "test": "solo medir (no interviene en ninguna decisión)"}
     for sp, name in SPLITS.items():
@@ -192,11 +216,33 @@ def main() -> None:
 
     # ---- final prediction ------------------------------------------------- #
     hr(f"4) PREDICCIÓN: {home} vs {away}")
+    xi, origin = {"h": None, "a": None}, "habitual (los 11 con más titularidades recientes)"
+    official = confirmed_lineup(league, match_id) if match_id and tr["book"] else None
+    if official:
+        xi, origin = {"h": official["h"], "a": official["a"]}, "confirmada por ESPN"
+        tr["names"].update(official["names"])
+    for side, team, raw in (("h", home, args.home_out), ("a", away, args.away_out)):
+        out = match_players(raw, tr, league, team)
+        if out:
+            xi[side], origin = without_players(tr, league, team, out), "habitual con las bajas indicadas"
     try:
-        res = predict(tr, league, home, away, kickoff, neutral, args.conf)
+        res = predict(tr, league, home, away, kickoff, neutral, args.conf, xi["h"], xi["a"])
     except ValueError as exc:
         sys.exit(str(exc))
     proba, feats = res["proba"], res["feats"]
+    if res["xi"]:
+        print(f"Alineación usada: {origin}. Para quitar jugadores: --home-out \"Nombre,Nombre\" --away-out \"Nombre\"")
+        for side, team in (("h", home), ("a", away)):
+            if side not in res["xi"]:
+                print(f"  {team}: sin datos de jugadores")
+                continue
+            tab = player_table(tr, league, team, res["xi"][side])
+            print(f"  {team}: " + ", ".join(tab["Jugador"]))
+            top = tab.sort_values("Goles", ascending=False).head(3)
+            print("      más peligrosos (goles por partido de titular): "
+                  + ", ".join(f"{r.Jugador} {r.Goles:.2f}" for r in top.itertuples()))
+    else:
+        print("Sin datos de jugadores para este partido; la predicción usa solo datos de equipo.")
     print(f"Elo: {home} {res['elo_home']:.0f}  |  {away} {res['elo_away']:.0f}   "
           f"Forma (pts/partido últimos 5): {home} {feats['h_pts_s']:.2f} | {away} {feats['a_pts_s']:.2f}")
     print(f"\n  Gana {home:<24} {pct(proba[0])}")
@@ -209,6 +255,12 @@ def main() -> None:
           + f"  (prob. {pct(proba[winner]).strip()})")
     p_no_draw = proba[0] / (proba[0] + proba[2])
     print(f"    Si descartamos el empate: {home} {pct(p_no_draw).strip()} vs {away} {pct(1 - p_no_draw).strip()}")
+    base = res["base"]
+    if base:
+        b = base["proba"]
+        print(f"    Con las alineaciones habituales sería: {home} {pct(b[0]).strip()}, empate {pct(b[1]).strip()}, "
+              f"{away} {pct(b[2]).strip()}. Goles esperados {base['counts']['goals']['mu']:.2f} → "
+              f"{res['counts']['goals']['mu']:.2f} con esta alineación.")
 
     for key, r in res["counts"].items():
         t, v = TARGETS[key], r["view"]
